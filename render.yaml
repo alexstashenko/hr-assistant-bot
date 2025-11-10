@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: hr-assistant-bot
+    env: python
+    region: frankfurt  # Можно изменить на oregon, singapore и т.д.
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python hr_assistant_bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: PORT
+        value: 8080

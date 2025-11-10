@@ -1,0 +1,23 @@
+# fly.toml app configuration file
+# Сгенерировано для hr-assistant-bot
+
+app = "hr-assistant-bot"
+primary_region = "fra"  # Frankfurt - можно изменить на ближайший к вам
+
+[build]
+
+[env]
+  PORT = "8080"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 256
