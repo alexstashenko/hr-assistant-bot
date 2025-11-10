@@ -10,3 +10,6 @@ anthropic==0.28.0
 python-dotenv==1.0.0
 
 cryptography>=41.0.0
+
+# Force fresh install
+--no-cache-dir
