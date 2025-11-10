@@ -1,10 +1,12 @@
 # Зависимости для HR Assistant Telegram Bot
 
 # Telegram Bot API
-python-telegram-bot==20.5
+python-telegram-bot==21.1
 
 # Anthropic Claude API
 anthropic==0.28.0
 
 # Переменные окружения
 python-dotenv==1.0.0
+
+cryptography>=41.0.0
