@@ -227,30 +227,32 @@ def start_health_server():
 
 def clean_markdown(text: str) -> str:
     """Удаляет markdown форматирование из текста для чистого отображения в Telegram"""
-    # Удаляем жирный текст (**text** или __text__)
-    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
-    text = re.sub(r'__(.+?)__', r'\1', text)
-    
-    # Удаляем курсив (*text* или _text_)
-    text = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'\1', text)
-    text = re.sub(r'(?<!_)_(?!_)(.+?)(?<!_)_(?!_)', r'\1', text)
-    
-    # Удаляем заголовки (# ## ### и т.д.)
-    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
-    
-    # Удаляем блоки кода (```code```)
-    text = re.sub(r'```[\s\S]*?```', '', text)
-    
-    # Удаляем инлайн код (`code`)
-    text = re.sub(r'`([^`]+)`', r'\1', text)
-    
-    # Удаляем зачеркнутый текст (~~text~~)
-    text = re.sub(r'~~(.+?)~~', r'\1', text)
-    
-    # Удаляем маркеры списков
-    text = re.sub(r'^[\*\-\+]\s+', '• ', text, flags=re.MULTILINE)
-    
-    return text.strip()
+    try:
+        # Удаляем жирный текст (**text** или __text__)
+        text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+        text = re.sub(r'__(.+?)__', r'\1', text)
+        
+        # Удаляем курсив простым способом
+        text = text.replace('*', '')
+        text = text.replace('_', '')
+        
+        # Удаляем заголовки (# ## ### и т.д.)
+        text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+        
+        # Удаляем блоки кода
+        text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
+        
+        # Удаляем инлайн код
+        text = re.sub(r'`([^`]+)`', r'\1', text)
+        
+        # Удаляем тильды
+        text = text.replace('~~', '')
+        
+        return text.strip()
+    except Exception as e:
+        # Если что-то пошло не так, вернем оригинальный текст
+        logger.warning(f"Error in clean_markdown: {e}")
+        return text
 
 
 class HRAssistantBot:
@@ -314,7 +316,7 @@ class HRAssistantBot:
             
             # Отправляем запрос к Claude
             response = self.anthropic_client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model="claude-haiku-4-5-20251001",
                 max_tokens=4096,
                 system=SYSTEM_PROMPT,
                 messages=conversation_history
@@ -333,6 +335,8 @@ class HRAssistantBot:
             
         except Exception as e:
             logger.error(f"Ошибка при получении ответа от Claude: {e}")
+            logger.error(f"Тип ошибки: {type(e).__name__}")
+            logger.error(f"Детали: {str(e)}")
             return "Извините, произошла ошибка при обработке вашего запроса. Попробуйте еще раз."
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
