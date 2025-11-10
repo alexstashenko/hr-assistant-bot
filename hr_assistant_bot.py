@@ -10,7 +10,6 @@ import os
 import logging
 from typing import Dict, List
 from datetime import datetime
-
 import anthropic
 from telegram import Update
 from telegram.ext import (
@@ -24,7 +23,17 @@ from dotenv import load_dotenv
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 
-# Загружаем переменные окружения из .env файла
+# Отключаем телеметрию Anthropic
+os.environ['ANTHROPIC_DISABLE_TELEMETRY'] = 'true'
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Загружаем переменные окружения
 load_dotenv()
 
 # Настройка логирования
