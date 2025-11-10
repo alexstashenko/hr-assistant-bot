@@ -336,7 +336,7 @@ class HRAssistantBot:
             "Давайте начнем! Какая ситуация вас беспокоит?"
         )
         
-        await update.message.reply_text(welcome_message)
+        await update.message.reply_text(welcome_message, parse_mode="Markdown")
         logger.info(f"Пользователь {user_id} ({user.username}) начал работу с ботом")
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -363,7 +363,7 @@ class HRAssistantBot:
             "Ситуационное лидерство Херси-Бланшара) для диагностики и рекомендаций."
         )
         
-        await update.message.reply_text(help_message)
+        await update.message.reply_text(help_message, parse_mode="Markdown")
     
     async def new_conversation_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /new для начала нового разговора"""
@@ -393,12 +393,12 @@ class HRAssistantBot:
         # Telegram имеет ограничение на длину сообщения (4096 символов)
         # Если ответ длиннее, разбиваем на части
         if len(response) <= 4096:
-            await update.message.reply_text(response)
+            await update.message.reply_text(response, parse_mode="Markdown")
         else:
             # Разбиваем на части по 4000 символов
             parts = [response[i:i+4000] for i in range(0, len(response), 4000)]
             for part in parts:
-                await update.message.reply_text(part)
+                await update.message.reply_text(part, parse_mode="Markdown")
                 await update.message.chat.send_action("typing")
     
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
