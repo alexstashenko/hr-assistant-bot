@@ -8,6 +8,7 @@ HR Assistant Telegram Bot
 
 import os
 import logging
+import re
 from typing import Dict, List
 from datetime import datetime
 
