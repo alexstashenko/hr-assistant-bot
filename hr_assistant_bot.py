@@ -9,8 +9,10 @@ HR Assistant Telegram Bot
 import os
 import logging
 import re
+import json
 from typing import Dict, List
 from datetime import datetime
+from pathlib import Path
 
 import anthropic
 from telegram import Update
@@ -34,6 +36,9 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Файл для хранения данных о пользователях
+USER_DATA_FILE = "user_data.json"
 
 # Системный промпт для Claude
 SYSTEM_PROMPT = """# **РОЛЬ: Ассистент по управлению персоналом**
@@ -246,16 +251,18 @@ def clean_markdown(text: str) -> str:
 class HRAssistantBot:
     """Класс для управления HR-ассистентом ботом"""
     
-    def __init__(self, telegram_token: str, anthropic_api_key: str):
+    def __init__(self, telegram_token: str, anthropic_api_key: str, admin_telegram_id: int):
         """
         Инициализация бота
         
         Args:
             telegram_token: Токен Telegram бота
             anthropic_api_key: API ключ Anthropic
+            admin_telegram_id: Telegram ID администратора
         """
         self.telegram_token = telegram_token
         self.anthropic_client = anthropic.Anthropic(api_key=anthropic_api_key)
+        self.admin_telegram_id = admin_telegram_id
         
         # Хранилище истории разговоров по пользователям
         self.conversations: Dict[int, List[Dict]] = {}
@@ -263,6 +270,113 @@ class HRAssistantBot:
         # Хранилище состояний ожидания подтверждения сброса
         self.pending_reset: Dict[int, bool] = {}
         
+        # Загружаем данные о пользователях
+        self.user_data = self.load_user_data()
+        
+        # Telegram Application (будет установлен в run())
+        self.application = None
+        
+    def load_user_data(self) -> Dict:
+        """Загрузить данные о пользователях из файла"""
+        if Path(USER_DATA_FILE).exists():
+            try:
+                with open(USER_DATA_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    logger.info(f"Загружены данные о {len(data)} пользователях")
+                    return data
+            except Exception as e:
+                logger.error(f"Ошибка при загрузке данных пользователей: {e}")
+                return {}
+        return {}
+    
+    def save_user_data(self):
+        """Сохранить данные о пользователях в файл"""
+        try:
+            with open(USER_DATA_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.user_data, f, ensure_ascii=False, indent=2)
+            logger.info("Данные пользователей сохранены")
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении данных пользователей: {e}")
+    
+    def get_user_info(self, user_id: int) -> Dict:
+        """Получить информацию о пользователе"""
+        user_id_str = str(user_id)
+        if user_id_str not in self.user_data:
+            self.user_data[user_id_str] = {
+                "consultations_completed": 0,
+                "full_access": False,
+                "first_seen": datetime.now().isoformat(),
+                "username": None,
+                "first_name": None
+            }
+            self.save_user_data()
+        return self.user_data[user_id_str]
+    
+    def update_user_info(self, user_id: int, username: str = None, first_name: str = None):
+        """Обновить информацию о пользователе"""
+        user_id_str = str(user_id)
+        user_info = self.get_user_info(user_id)
+        if username:
+            user_info["username"] = username
+        if first_name:
+            user_info["first_name"] = first_name
+        self.save_user_data()
+    
+    def increment_consultations(self, user_id: int):
+        """Увеличить счетчик завершенных консультаций"""
+        user_id_str = str(user_id)
+        user_info = self.get_user_info(user_id)
+        user_info["consultations_completed"] += 1
+        self.save_user_data()
+        logger.info(f"User {user_id}: консультаций завершено {user_info['consultations_completed']}")
+    
+    def has_access(self, user_id: int) -> bool:
+        """Проверить, есть ли у пользователя доступ"""
+        # Админ всегда имеет доступ
+        if user_id == self.admin_telegram_id:
+            return True
+        
+        user_info = self.get_user_info(user_id)
+        
+        # Если есть полный доступ
+        if user_info.get("full_access", False):
+            return True
+        
+        # Если меньше 3 консультаций - доступ есть
+        return user_info.get("consultations_completed", 0) < 3
+    
+    def get_remaining_consultations(self, user_id: int) -> int:
+        """Получить количество оставшихся консультаций"""
+        if user_id == self.admin_telegram_id:
+            return 999  # Админ имеет неограниченный доступ
+        
+        user_info = self.get_user_info(user_id)
+        if user_info.get("full_access", False):
+            return 999  # Полный доступ
+        
+        completed = user_info.get("consultations_completed", 0)
+        return max(0, 3 - completed)
+    
+    async def notify_admin_demo_complete(self, user_id: int, username: str, first_name: str):
+        """Отправить уведомление администратору о завершении демо"""
+        try:
+            message = (
+                f"🔔 УВЕДОМЛЕНИЕ: Пользователь завершил ДЕМО\n\n"
+                f"👤 Имя: {first_name or 'Не указано'}\n"
+                f"📱 Username: @{username or 'не указан'}\n"
+                f"🆔 Telegram ID: {user_id}\n"
+                f"📅 Время: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n\n"
+                f"Пользователь исчерпал 3 бесплатные консультации."
+            )
+            
+            await self.application.bot.send_message(
+                chat_id=self.admin_telegram_id,
+                text=message
+            )
+            logger.info(f"Отправлено уведомление админу о завершении демо пользователем {user_id}")
+        except Exception as e:
+            logger.error(f"Ошибка при отправке уведомления админу: {e}")
+    
     def get_conversation_history(self, user_id: int) -> List[Dict]:
         """Получить историю разговора пользователя"""
         if user_id not in self.conversations:
@@ -384,15 +498,29 @@ class HRAssistantBot:
                 # Устанавливаем флаг ожидания подтверждения
                 self.pending_reset[user_id] = True
                 
+                # Получаем количество оставшихся консультаций
+                remaining = self.get_remaining_consultations(user_id)
+                
                 # Добавляем вопрос о завершении
-                assistant_message += (
-                    "\n\n━━━━━━━━━━━━━━━━━━━━━\n"
-                    "✅ Консультация завершена!\n\n"
-                    "Готовы ли вы завершить диалог и очистить историю для новой консультации?\n\n"
-                    "Ответьте 'Да' или 'Нет':\n"
-                    "• ДА — История будет очищена, готов к новому запросу\n"
-                    "• НЕТ — Продолжим текущий разговор"
-                )
+                if remaining > 0:
+                    assistant_message += (
+                        "\n\n━━━━━━━━━━━━━━━━━━━━━\n"
+                        "✅ Консультация завершена!\n\n"
+                        f"📊 У вас осталось: {remaining} консультаций в демо-режиме\n\n"
+                        "Готовы ли вы завершить диалог и очистить историю для новой консультации?\n\n"
+                        "Ответьте 'Да' или 'Нет':\n"
+                        "• ДА — История будет очищена, готов к новому запросу\n"
+                        "• НЕТ — Продолжим текущий разговор"
+                    )
+                else:
+                    assistant_message += (
+                        "\n\n━━━━━━━━━━━━━━━━━━━━━\n"
+                        "✅ Консультация завершена!\n\n"
+                        "Готовы ли вы завершить диалог?\n\n"
+                        "Ответьте 'Да' или 'Нет':\n"
+                        "• ДА — Завершить консультацию\n"
+                        "• НЕТ — Продолжим текущий разговор"
+                    )
             
             return assistant_message
             
@@ -407,12 +535,33 @@ class HRAssistantBot:
         user = update.effective_user
         user_id = user.id
         
+        # Обновляем информацию о пользователе
+        self.update_user_info(user_id, user.username, user.first_name)
+        
         # Очищаем историю при старте
         self.clear_conversation(user_id)
         
+        # Проверяем доступ
+        if not self.has_access(user_id):
+            await update.message.reply_text(
+                "🔒 ДЕМО-РЕЖИМ ЗАВЕРШЕН\n\n"
+                "Вы исчерпали 3 бесплатные консультации.\n\n"
+                "Если вам нужен постоянный доступ к HR-ассистенту, "
+                "обратитесь к @alexander_stashenko\n\n"
+                "Спасибо за использование бота! 🙏"
+            )
+            return
+        
+        remaining = self.get_remaining_consultations(user_id)
+        demo_info = ""
+        
+        if remaining < 999:  # Не админ и не полный доступ
+            demo_info = f"\n\n🎯 ДЕМО-РЕЖИМ: У вас {remaining} консультаций"
+        
         welcome_message = (
             f"👋 Здравствуйте, {user.first_name}!\n\n"
-            "Я — ваш персональный консультант по управлению персоналом на базе Claude AI.\n\n"
+            "Я — ваш персональный консультант по управлению персоналом на базе Claude AI."
+            f"{demo_info}\n\n"
             "🎯 Я помогу вам:\n"
             "• Разобраться с мотивацией\n"
             "• Давать эффективную обратную связь\n"
@@ -433,6 +582,13 @@ class HRAssistantBot:
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /help"""
+        user_id = update.effective_user.id
+        remaining = self.get_remaining_consultations(user_id)
+        
+        demo_info = ""
+        if remaining < 999:
+            demo_info = f"\n\nДЕМО-РЕЖИМ: У вас осталось {remaining} консультаций"
+        
         help_message = (
             "📚 Как работать с ботом:\n\n"
             "1️⃣ Опишите вашу ситуацию или проблему с сотрудником/командой\n"
@@ -453,7 +609,8 @@ class HRAssistantBot:
             "• \"Нужно отказать в повышении\"\n\n"
             "⚡️ Автоматическая оптимизация:\n"
             "После завершения консультации бот предложит очистить историю "
-            "для более эффективной работы при следующем обращении.\n\n"
+            "для более эффективной работы при следующем обращении."
+            f"{demo_info}\n\n"
             "Я использую проверенные модели управления (PAEI Адизеса, "
             "Ситуационное лидерство Херси-Бланшара) для диагностики и рекомендаций."
         )
@@ -463,13 +620,74 @@ class HRAssistantBot:
     async def new_conversation_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /new для начала нового разговора"""
         user_id = update.effective_user.id
+        
+        # Проверяем доступ
+        if not self.has_access(user_id):
+            await update.message.reply_text(
+                "🔒 ДЕМО-РЕЖИМ ЗАВЕРШЕН\n\n"
+                "Вы исчерпали 3 бесплатные консультации.\n\n"
+                "Если вам нужен постоянный доступ к HR-ассистенту, "
+                "обратитесь к @alexander_stashenko"
+            )
+            return
+        
         self.clear_conversation(user_id)
         
+        remaining = self.get_remaining_consultations(user_id)
+        demo_info = ""
+        if remaining < 999:
+            demo_info = f"\n\n📊 Осталось консультаций: {remaining}"
+        
         await update.message.reply_text(
-            "✅ История разговора очищена. Начнем с начала!\n\n"
+            f"✅ История разговора очищена. Начнем с начала!{demo_info}\n\n"
             "Опишите новую ситуацию, с которой вам нужна помощь."
         )
         logger.info(f"Пользователь {user_id} начал новый разговор")
+    
+    async def grant_access_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /grant для предоставления полного доступа (только для админа)"""
+        user_id = update.effective_user.id
+        
+        # Проверяем, что команду вызвал админ
+        if user_id != self.admin_telegram_id:
+            await update.message.reply_text("⛔️ У вас нет прав для выполнения этой команды.")
+            return
+        
+        # Проверяем формат команды
+        if not context.args or len(context.args) != 1:
+            await update.message.reply_text(
+                "Использование: /grant <user_id>\n\n"
+                "Пример: /grant 123456789"
+            )
+            return
+        
+        try:
+            target_user_id = int(context.args[0])
+            user_id_str = str(target_user_id)
+            
+            # Получаем и обновляем данные пользователя
+            user_info = self.get_user_info(target_user_id)
+            user_info["full_access"] = True
+            self.save_user_data()
+            
+            username = user_info.get("username", "неизвестен")
+            first_name = user_info.get("first_name", "Неизвестно")
+            
+            await update.message.reply_text(
+                f"✅ Полный доступ предоставлен!\n\n"
+                f"👤 Пользователь: {first_name}\n"
+                f"📱 Username: @{username}\n"
+                f"🆔 ID: {target_user_id}\n\n"
+                f"Пользователь теперь имеет неограниченный доступ к боту."
+            )
+            
+            logger.info(f"Админ {user_id} предоставил полный доступ пользователю {target_user_id}")
+            
+        except ValueError:
+            await update.message.reply_text("❌ Ошибка: ID пользователя должен быть числом.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Произошла ошибка: {str(e)}")
+            logger.error(f"Ошибка при предоставлении доступа: {e}")
     
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик текстовых сообщений"""
@@ -477,7 +695,21 @@ class HRAssistantBot:
         user_id = user.id
         user_message = update.message.text
         
+        # Обновляем информацию о пользователе
+        self.update_user_info(user_id, user.username, user.first_name)
+        
         logger.info(f"Сообщение от {user_id} ({user.username}): {user_message[:50]}...")
+        
+        # Проверяем доступ
+        if not self.has_access(user_id):
+            await update.message.reply_text(
+                "🔒 ДЕМО-РЕЖИМ ЗАВЕРШЕН\n\n"
+                "Вы исчерпали 3 бесплатные консультации.\n\n"
+                "Если вам нужен постоянный доступ к HR-ассистенту, "
+                "обратитесь к @alexander_stashenko\n\n"
+                "Спасибо за использование бота! 🙏"
+            )
+            return
         
         # Проверяем, ожидается ли подтверждение сброса
         if self.pending_reset.get(user_id, False):
@@ -488,15 +720,39 @@ class HRAssistantBot:
             negative_answers = ['нет', 'no', 'не надо', 'продолжим', '-', '❌']
             
             if any(ans in user_message_lower for ans in positive_answers):
-                # Пользователь согласен на сброс
+                # Пользователь согласен на сброс - увеличиваем счетчик
+                self.increment_consultations(user_id)
+                remaining = self.get_remaining_consultations(user_id)
+                
+                # Очищаем историю
                 self.clear_conversation(user_id)
                 
-                await update.message.reply_text(
-                    "✅ Отлично! История диалога очищена.\n\n"
-                    "🚀 Я готов к новой консультации. Система работает оптимально.\n\n"
-                    "Опишите новую ситуацию или задайте вопрос."
-                )
-                logger.info(f"User {user_id}: история очищена по подтверждению")
+                # Проверяем, закончились ли консультации
+                if remaining == 0:
+                    # Отправляем уведомление админу
+                    await self.notify_admin_demo_complete(
+                        user_id,
+                        user.username or "не указан",
+                        user.first_name or "Не указано"
+                    )
+                    
+                    await update.message.reply_text(
+                        "✅ Консультация завершена!\n\n"
+                        "🔒 ДЕМО-РЕЖИМ ЗАВЕРШЕН\n\n"
+                        "Вы исчерпали 3 бесплатные консультации.\n\n"
+                        "💼 Если вам нужен постоянный доступ к HR-ассистенту, "
+                        "обратитесь к @alexander_stashenko\n\n"
+                        "Спасибо за использование бота! 🙏"
+                    )
+                    logger.info(f"User {user_id}: демо-режим завершен")
+                else:
+                    await update.message.reply_text(
+                        "✅ Отлично! Консультация завершена.\n\n"
+                        f"📊 У вас осталось: {remaining} консультаций\n\n"
+                        "🚀 История диалога очищена. Готов к новой консультации!\n\n"
+                        "Опишите новую ситуацию или задайте вопрос."
+                    )
+                    logger.info(f"User {user_id}: консультация завершена, осталось {remaining}")
                 return
             
             elif any(ans in user_message_lower for ans in negative_answers):
@@ -550,22 +806,23 @@ class HRAssistantBot:
         start_health_server()
         
         # Создаем приложение
-        application = Application.builder().token(self.telegram_token).build()
+        self.application = Application.builder().token(self.telegram_token).build()
         
         # Регистрируем обработчики команд
-        application.add_handler(CommandHandler("start", self.start_command))
-        application.add_handler(CommandHandler("help", self.help_command))
-        application.add_handler(CommandHandler("new", self.new_conversation_command))
+        self.application.add_handler(CommandHandler("start", self.start_command))
+        self.application.add_handler(CommandHandler("help", self.help_command))
+        self.application.add_handler(CommandHandler("new", self.new_conversation_command))
+        self.application.add_handler(CommandHandler("grant", self.grant_access_command))
         
         # Регистрируем обработчик текстовых сообщений
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         
         # Регистрируем обработчик ошибок
-        application.add_error_handler(self.error_handler)
+        self.application.add_error_handler(self.error_handler)
         
         # Запускаем бота
         logger.info("Бот запущен и готов к работе!")
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        self.application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 def main():
@@ -573,6 +830,7 @@ def main():
     # Получаем токены из переменных окружения
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
     anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+    admin_telegram_id = os.getenv("ADMIN_TELEGRAM_ID")
     
     if not telegram_token:
         raise ValueError("Не установлена переменная окружения TELEGRAM_BOT_TOKEN")
@@ -580,55 +838,18 @@ def main():
     if not anthropic_api_key:
         raise ValueError("Не установлена переменная окружения ANTHROPIC_API_KEY")
     
+    if not admin_telegram_id:
+        raise ValueError("Не установлена переменная окружения ADMIN_TELEGRAM_ID")
+    
+    try:
+        admin_telegram_id = int(admin_telegram_id)
+    except ValueError:
+        raise ValueError("ADMIN_TELEGRAM_ID должен быть числом")
+    
     # Создаем и запускаем бота
-    bot = HRAssistantBot(telegram_token, anthropic_api_key)
+    bot = HRAssistantBot(telegram_token, anthropic_api_key, admin_telegram_id)
     bot.run()
 
 
 if __name__ == "__main__":
     main()
-```
-
-## Что изменилось:
-
-### ✅ **1. Автоматическое определение завершения консультации**
-- Метод `is_consultation_complete()` анализирует ответ Claude на наличие ключевых слов
-- Требует 3+ индикатора для уверенности (диагностика, план действий, что сказать и т.д.)
-
-### ✅ **2. Запрос подтверждения у пользователя**
-- После завершения консультации бот спрашивает: "Готовы ли завершить?"
-- Добавлен словарь `self.pending_reset` для отслеживания состояния
-- Умное распознавание ответов: да/yes/ок/конечно/+ и нет/no/не надо/-
-
-### ✅ **3. Защита от переполнения (20 сообщений)**
-- Проверка `len(conversation_history) >= 20` перед отправкой в API
-- Автоматическая очистка с предупреждением пользователю
-- Не тратит токены на превышение лимита
-
-### ✅ **4. Логирование токенов**
-- Каждый запрос логирует количество сообщений и использованных токенов
-- Помогает отслеживать экономию
-
-## Тестирование:
-
-**Сценарий 1:** Нормальная консультация
-```
-Пользователь: "Мой сотрудник опаздывает"
-Бот: [задаёт вопросы]
-Пользователь: [отвечает]
-Бот: [даёт рекомендации] + "Готовы завершить? Да/Нет"
-Пользователь: "Да"
-Бот: "✅ История очищена. Готов к новому"
-```
-
-**Сценарий 2:** Продолжение
-```
-Бот: "Готовы завершить?"
-Пользователь: "Нет, ещё вопрос"
-Бот: "👌 Продолжаем"
-```
-
-**Сценарий 3:** Превышение 20 сообщений
-```
-[После 20го обмена]
-Бот: "⚠️ Лимит достигнут. История очищена автоматически"
