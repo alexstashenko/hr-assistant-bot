@@ -386,9 +386,7 @@ class HRAssistantBot:
         user_info = self.get_user_info(user_id)
         
         # Заголовок
-        text = f"=" * 80 + "\n"
         text += f"ИСТОРИЯ ПЕРЕПИСКИ\n"
-        text += f"=" * 80 + "\n\n"
         text += f"Пользователь: {user_info.get('first_name', 'Не указано')}\n"
         text += f"Username: @{user_info.get('username', 'не указан')}\n"
         text += f"Telegram ID: {user_id}\n"
@@ -401,12 +399,9 @@ class HRAssistantBot:
         for i, msg in enumerate(conversation, 1):
             role = "ПОЛЬЗОВАТЕЛЬ" if msg["role"] == "user" else "АССИСТЕНТ"
             text += f"[{i}] {role}:\n"
-            text += f"{'-' * 80}\n"
             text += f"{msg['content']}\n\n"
         
-        text += "=" * 80 + "\n"
         text += "КОНЕЦ ИСТОРИИ ПЕРЕПИСКИ\n"
-        text += "=" * 80 + "\n"
         
         return text
     
