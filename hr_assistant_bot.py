@@ -384,6 +384,9 @@ class HRAssistantBot:
         """Форматировать историю переписки в текстовый формат"""
         conversation = self.conversations.get(user_id, [])
         user_info = self.get_user_info(user_id)
+
+        # Инициализируем переменную text
+        text = ""
         
         # Заголовок
         text += f"ИСТОРИЯ ПЕРЕПИСКИ\n"
