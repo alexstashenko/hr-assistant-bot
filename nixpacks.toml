@@ -1,2 +1,5 @@
 [phases.setup]
-   aptPkgs = ["ffmpeg"]
+aptPkgs = ["ffmpeg", "git", "build-essential"]
+
+[phases.install]
+cmds = ["pip install --upgrade pip setuptools wheel"]
