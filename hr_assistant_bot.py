@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-HR Assistant Telegram Bot
+HR Assistant Telegram Bot с поддержкой голосовых сообщений
 Консультант по управлению персоналом на базе Claude AI
 """
 
@@ -10,9 +10,11 @@ import os
 import logging
 import re
 import json
+import asyncio
 from typing import Dict, List
 from datetime import datetime
 from pathlib import Path
+import tempfile
 
 import anthropic
 from telegram import Update
@@ -28,6 +30,11 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 import io
 
+# Новые импорты для работы с голосом
+import whisper
+import edge_tts
+from pydub import AudioSegment
+
 # Загружаем переменные окружения из .env файла
 load_dotenv()
 
@@ -41,11 +48,15 @@ logger = logging.getLogger(__name__)
 # Файлы для хранения данных
 USER_DATA_FILE = "user_data.json"
 CONVERSATIONS_DIR = "conversations"
+VOICE_DIR = "voice_temp"
+
+# Создаем директорию для временных голосовых файлов
+Path(VOICE_DIR).mkdir(exist_ok=True)
 
 # Системный промпт для Claude
 SYSTEM_PROMPT = """# **РОЛЬ: Ассистент по управлению персоналом**
 
-Вы — опытный консультант по управлению людьми, который помогает руководителям эффективно работать со своими подчиненными, а также помогает подчиненным эффективно работать со своими руководителями и коллегами. Ваша задача — давать краткие, практичные, применимые на практике рекомендации.
+Вы — опытный консультант по управлению людьми, который помогает руководителям эффективно работать со своими подчиненными, а также помогает подчиненным эффективно работаь со своими руководителями и коллегами. Ваша задача — давать краткие, практичные, применимые на практике рекомендации.
 
 ---
 
@@ -250,6 +261,86 @@ def clean_markdown(text: str) -> str:
         return text
 
 
+class VoiceProcessor:
+    """Класс для обработки голосовых сообщений"""
+    
+    def __init__(self):
+        """Инициализация процессора голоса"""
+        # Загружаем модель Whisper (используем base для баланса скорости и качества)
+        # Можно использовать 'tiny' для быстрой работы или 'small'/'medium' для лучшего качества
+        logger.info("Загрузка модели Whisper...")
+        self.whisper_model = whisper.load_model("base")
+        logger.info("Модель Whisper загружена")
+        
+        # Голос для TTS (русский женский голос от Microsoft)
+        self.tts_voice = "ru-RU-SvetlanaNeural"
+    
+    async def speech_to_text(self, voice_file_path: str) -> str:
+        """
+        Конвертировать голосовое сообщение в текст
+        
+        Args:
+            voice_file_path: Путь к голосовому файлу
+            
+        Returns:
+            Распознанный текст
+        """
+        try:
+            logger.info(f"Начало распознавания речи из файла: {voice_file_path}")
+            
+            # Конвертируем .ogg в .wav для Whisper
+            audio = AudioSegment.from_file(voice_file_path)
+            wav_path = voice_file_path.replace('.ogg', '.wav')
+            audio.export(wav_path, format='wav')
+            
+            # Распознаем речь с помощью Whisper
+            # Запускаем в отдельном потоке, чтобы не блокировать asyncio
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: self.whisper_model.transcribe(wav_path, language='ru')
+            )
+            
+            text = result['text'].strip()
+            logger.info(f"Распознанный текст: {text[:100]}...")
+            
+            # Удаляем временные файлы
+            try:
+                os.remove(voice_file_path)
+                os.remove(wav_path)
+            except Exception as e:
+                logger.warning(f"Не удалось удалить временные файлы: {e}")
+            
+            return text
+            
+        except Exception as e:
+            logger.error(f"Ошибка при распознавании речи: {e}")
+            raise
+    
+    async def text_to_speech(self, text: str, output_path: str):
+        """
+        Конвертировать текст в голос
+        
+        Args:
+            text: Текст для синтеза
+            output_path: Путь для сохранения аудиофайла
+        """
+        try:
+            logger.info(f"Начало синтеза речи, текст длиной {len(text)} символов")
+            
+            # Создаем TTS объект
+            communicate = edge_tts.Communicate(text, self.tts_voice)
+            
+            # Сохраняем в файл
+            await communicate.save(output_path)
+            
+            logger.info(f"Голосовое сообщение сохранено: {output_path}")
+            
+        except Exception as e:
+            logger.error(f"Ошибка при синтезе речи: {e}")
+            raise
+
+
 class HRAssistantBot:
     """Класс для управления HR-ассистентом ботом"""
     
@@ -266,8 +357,14 @@ class HRAssistantBot:
         self.anthropic_client = anthropic.Anthropic(api_key=anthropic_api_key)
         self.admin_telegram_id = admin_telegram_id
         
+        # Инициализируем процессор голоса
+        self.voice_processor = VoiceProcessor()
+        
         # Хранилище истории разговоров по пользователям (только для контекста)
         self.conversations: Dict[int, List[Dict]] = {}
+        
+        # Настройки голосовых ответов для каждого пользователя
+        self.voice_response_enabled: Dict[int, bool] = {}
         
         # Создаем директорию для хранения истории переписок
         Path(CONVERSATIONS_DIR).mkdir(exist_ok=True)
@@ -331,7 +428,8 @@ class HRAssistantBot:
                 "demo_completed_notified": False,
                 "first_seen": datetime.now().isoformat(),
                 "username": None,
-                "first_name": None
+                "first_name": None,
+                "voice_response_enabled": False
             }
             self.save_user_data()
         return self.user_data[user_id_str]
@@ -380,6 +478,24 @@ class HRAssistantBot:
         self.save_user_data()
         logger.info(f"Админ сбросил лимит для пользователя {user_id}")
     
+    def toggle_voice_response(self, user_id: int) -> bool:
+        """Переключить режим голосовых ответов для пользователя"""
+        user_info = self.get_user_info(user_id)
+        current = user_info.get("voice_response_enabled", False)
+        user_info["voice_response_enabled"] = not current
+        self.voice_response_enabled[user_id] = not current
+        self.save_user_data()
+        return not current
+    
+    def is_voice_response_enabled(self, user_id: int) -> bool:
+        """Проверить, включены ли голосовые ответы для пользователя"""
+        if user_id in self.voice_response_enabled:
+            return self.voice_response_enabled[user_id]
+        user_info = self.get_user_info(user_id)
+        enabled = user_info.get("voice_response_enabled", False)
+        self.voice_response_enabled[user_id] = enabled
+        return enabled
+    
     def format_conversation_as_text(self, user_id: int) -> str:
         """Форматировать историю переписки в текстовый формат"""
         conversation = self.conversations.get(user_id, [])
@@ -421,10 +537,10 @@ class HRAssistantBot:
             user_info = self.get_user_info(user_id)
             caption = (
                 f"История переписки пользователя:\n\n"
-                f"{user_info.get('first_name', 'Не указано')}\n"
-                f"@{user_info.get('username', 'не указан')}\n"
-                f"{user_id}\n"
-                f"Сообщений: {len(self.conversations.get(user_id, []))}"
+                f"👤 {user_info.get('first_name', 'Не указано')}\n"
+                f"📱 @{user_info.get('username', 'не указан')}\n"
+                f"🆔 {user_id}\n"
+                f"📊 Сообщений: {len(self.conversations.get(user_id, []))}"
             )
             
             # Отправляем файл админу
@@ -445,7 +561,7 @@ class HRAssistantBot:
         try:
             # Сначала отправляем короткое уведомление
             message = (
-                f"УВЕДОМЛЕНИЕ: Пользователь завершил ДЕМО\n\n"
+                f"🔔 УВЕДОМЛЕНИЕ: Пользователь завершил ДЕМО\n\n"
                 f"Имя: {first_name or 'Не указано'}\n"
                 f"Username: @{username or 'не указан'}\n"
                 f"Telegram ID: {user_id}\n"
@@ -591,10 +707,14 @@ class HRAssistantBot:
             "• Управлять производительностью\n"
             "• Проводить сложные разговоры\n"
             "• И многое другое!\n\n"
+            "🎤 ГОЛОСОВЫЕ СООБЩЕНИЯ:\n"
+            "• Отправьте голосовое - я распознаю и отвечу текстом\n"
+            "• Используйте /voice для переключения голосовых ответов\n\n"
             "Просто опишите вашу ситуацию, и я задам уточняющие вопросы, "
             "чтобы дать вам конкретные практичные рекомендации.\n\n"
             "💡 Команда:\n"
-            "/help — справка по использованию\n\n"
+            "/help — справка по использованию\n"
+            "/voice — переключить голосовые ответы\n\n"
             "Давайте начнем! Какая ситуация вас беспокоит?"
         )
         
@@ -611,6 +731,8 @@ class HRAssistantBot:
         if limit == 20:
             demo_info = f"\n\nДЕМО-РЕЖИМ: Осталось {remaining} из {limit} сообщений"
         
+        voice_status = "Включены ✅" if self.is_voice_response_enabled(user_id) else "Выключены ❌"
+        
         help_message = (
             "Как работать с ботом:\n\n"
             "1️⃣ Опишите вашу ситуацию или проблему с сотрудником/командой\n"
@@ -620,9 +742,14 @@ class HRAssistantBot:
             "   • Конкретный план действий\n"
             "   • Готовые скрипты разговоров\n"
             "   • Предупреждения о возможных ошибках\n\n"
+            "🎤 ГОЛОСОВЫЕ СООБЩЕНИЯ:\n"
+            "• Отправьте голосовое сообщение - я его распознаю\n"
+            f"• Голосовые ответы: {voice_status}\n"
+            "• Используйте /voice для переключения\n\n"
             "🔧 Доступные команды:\n"
             "/start — начать работу с ботом\n"
-            "/help — показать эту справку\n\n"
+            "/help — показать эту справку\n"
+            "/voice — переключить голосовые ответы\n\n"
             "Примеры запросов:\n"
             "• \"Мой сотрудник перестал выполнять задачи в срок\"\n"
             "• \"Как дать обратную связь о плохой работе?\"\n"
@@ -634,6 +761,39 @@ class HRAssistantBot:
         )
         
         await update.message.reply_text(help_message)
+    
+    async def voice_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /voice для переключения голосовых ответов"""
+        user_id = update.effective_user.id
+        
+        # Проверяем доступ
+        if not self.has_messages_left(user_id):
+            await update.message.reply_text(
+                "ДЕМО-РЕЖИМ ЗАВЕРШЕН\n\n"
+                "Вы исчерпали 20 бесплатных сообщений."
+            )
+            return
+        
+        # Переключаем режим
+        enabled = self.toggle_voice_response(user_id)
+        
+        if enabled:
+            message = (
+                "🔊 Голосовые ответы ВКЛЮЧЕНЫ\n\n"
+                "Теперь я буду отвечать голосовыми сообщениями.\n"
+                "Это работает как на текстовые, так и на голосовые вопросы.\n\n"
+                "Используйте /voice снова, чтобы отключить."
+            )
+        else:
+            message = (
+                "🔇 Голосовые ответы ВЫКЛЮЧЕНЫ\n\n"
+                "Теперь я буду отвечать только текстом.\n"
+                "Голосовые сообщения будут распознаваться и обрабатываться.\n\n"
+                "Используйте /voice снова, чтобы включить."
+            )
+        
+        await update.message.reply_text(message)
+        logger.info(f"Пользователь {user_id}: голосовые ответы {'включены' if enabled else 'выключены'}")
     
     async def grant_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /grant для сброса лимита (только для админа)"""
@@ -678,6 +838,129 @@ class HRAssistantBot:
         except Exception as e:
             await update.message.reply_text(f"❌ Произошла ошибка: {str(e)}")
             logger.error(f"Ошибка при сбросе лимита: {e}")
+    
+    async def handle_voice(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик голосовых сообщений"""
+        user = update.effective_user
+        user_id = user.id
+        
+        # Обновляем информацию о пользователе
+        self.update_user_info(user_id, user.username, user.first_name)
+        
+        logger.info(f"Голосовое сообщение от {user_id} ({user.username})")
+        
+        # Проверяем, есть ли у пользователя оставшиеся сообщения
+        if not self.has_messages_left(user_id):
+            # Отправляем уведомление админу, если еще не отправляли
+            user_info = self.get_user_info(user_id)
+            if not user_info.get("demo_completed_notified", False):
+                await self.notify_admin_demo_complete(
+                    user_id,
+                    user.username or "не указан",
+                    user.first_name or "Не указано"
+                )
+            
+            await update.message.reply_text(
+                "ДЕМО-РЕЖИМ ЗАВЕРШЕН\n\n"
+                "Вы исчерпали 20 бесплатных сообщений.\n\n"
+                "Если вам нужен постоянный доступ к ИИ-ассистенту, "
+                "обратитесь к @alexander_stashenko\n\n"
+                "Спасибо за использование бота! 🙏"
+            )
+            return
+        
+        try:
+            # Показываем индикатор "записывает голосовое"
+            await update.message.chat.send_action("record_voice")
+            
+            # Получаем файл голосового сообщения
+            voice_file = await update.message.voice.get_file()
+            
+            # Создаем временный файл для сохранения
+            voice_path = Path(VOICE_DIR) / f"voice_{user_id}_{datetime.now().timestamp()}.ogg"
+            await voice_file.download_to_drive(voice_path)
+            
+            logger.info(f"Голосовое сообщение сохранено: {voice_path}")
+            
+            # Показываем индикатор печати
+            await update.message.chat.send_action("typing")
+            
+            # Распознаем речь
+            await update.message.reply_text("🎤 Распознаю речь...")
+            user_message = await self.voice_processor.speech_to_text(str(voice_path))
+            
+            logger.info(f"Распознанный текст от {user_id}: {user_message[:100]}...")
+            
+            # Увеличиваем счетчик сообщений
+            self.increment_message_count(user_id)
+            
+            # Получаем количество оставшихся сообщений
+            remaining = self.get_remaining_messages(user_id)
+            
+            # Показываем индикатор печати
+            await update.message.chat.send_action("typing")
+            
+            # Получаем ответ от Claude
+            response = await self.get_claude_response(user_id, user_message)
+            
+            # Добавляем информацию об оставшихся сообщениях для демо-пользователей
+            if self.get_message_limit(user_id) == 20:
+                if remaining <= 5:  # Предупреждаем, когда остается мало
+                    response += f"\n\n⚠️ Осталось сообщений: {remaining}"
+                elif remaining == 10:  # Предупреждение на половине
+                    response += f"\n\n📊 Осталось сообщений: {remaining}"
+            
+            # Проверяем, нужно ли отправлять голосовой ответ
+            if self.is_voice_response_enabled(user_id):
+                # Сначала отправляем текстовый ответ
+                await update.message.reply_text(f"📝 {user_message}\n\n{response[:500]}..." if len(response) > 500 else f"📝 {user_message}\n\n{response}")
+                
+                # Показываем индикатор "записывает голосовое"
+                await update.message.chat.send_action("record_voice")
+                
+                # Генерируем голосовой ответ
+                voice_response_path = Path(VOICE_DIR) / f"response_{user_id}_{datetime.now().timestamp()}.mp3"
+                await self.voice_processor.text_to_speech(response, str(voice_response_path))
+                
+                # Отправляем голосовое сообщение
+                with open(voice_response_path, 'rb') as voice_file:
+                    await update.message.reply_voice(voice=voice_file)
+                
+                # Удаляем временный файл
+                try:
+                    os.remove(voice_response_path)
+                except Exception as e:
+                    logger.warning(f"Не удалось удалить файл ответа: {e}")
+            else:
+                # Отправляем только текстовый ответ с распознанным текстом
+                full_response = f"📝 Вы сказали: \"{user_message}\"\n\n{response}"
+                
+                # Telegram имеет ограничение на длину сообщения (4096 символов)
+                if len(full_response) <= 4096:
+                    await update.message.reply_text(full_response)
+                else:
+                    # Сначала отправляем распознанный текст
+                    await update.message.reply_text(f"📝 Вы сказали: \"{user_message}\"")
+                    # Затем разбиваем ответ на части по 4000 символов
+                    parts = [response[i:i+4000] for i in range(0, len(response), 4000)]
+                    for part in parts:
+                        await update.message.reply_text(part)
+                        await update.message.chat.send_action("typing")
+            
+            # Если у пользователя закончились сообщения после этого ответа
+            if remaining == 0:
+                await self.notify_admin_demo_complete(
+                    user_id,
+                    user.username or "не указан",
+                    user.first_name or "Не указано"
+                )
+                
+        except Exception as e:
+            logger.error(f"Ошибка при обработке голосового сообщения: {e}")
+            await update.message.reply_text(
+                "Извините, произошла ошибка при обработке голосового сообщения. "
+                "Попробуйте отправить текстовое сообщение или повторите попытку."
+            )
     
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик текстовых сообщений"""
@@ -729,16 +1012,49 @@ class HRAssistantBot:
             elif remaining == 10:  # Предупреждение на половине
                 response += f"\n\n📊 Осталось сообщений: {remaining}"
         
-        # Telegram имеет ограничение на длину сообщения (4096 символов)
-        # Если ответ длиннее, разбиваем на части
-        if len(response) <= 4096:
-            await update.message.reply_text(response)
+        # Проверяем, нужно ли отправлять голосовой ответ
+        if self.is_voice_response_enabled(user_id):
+            # Сначала отправляем текстовый ответ
+            if len(response) <= 4096:
+                await update.message.reply_text(response)
+            else:
+                # Разбиваем на части по 4000 символов
+                parts = [response[i:i+4000] for i in range(0, len(response), 4000)]
+                for part in parts:
+                    await update.message.reply_text(part)
+                    await update.message.chat.send_action("typing")
+            
+            # Показываем индикатор "записывает голосовое"
+            await update.message.chat.send_action("record_voice")
+            
+            # Генерируем голосовой ответ
+            try:
+                voice_response_path = Path(VOICE_DIR) / f"response_{user_id}_{datetime.now().timestamp()}.mp3"
+                await self.voice_processor.text_to_speech(response, str(voice_response_path))
+                
+                # Отправляем голосовое сообщение
+                with open(voice_response_path, 'rb') as voice_file:
+                    await update.message.reply_voice(voice=voice_file)
+                
+                # Удаляем временный файл
+                try:
+                    os.remove(voice_response_path)
+                except Exception as e:
+                    logger.warning(f"Не удалось удалить файл ответа: {e}")
+            except Exception as e:
+                logger.error(f"Ошибка при генерации голосового ответа: {e}")
+                await update.message.reply_text("(Не удалось сгенерировать голосовой ответ)")
         else:
-            # Разбиваем на части по 4000 символов
-            parts = [response[i:i+4000] for i in range(0, len(response), 4000)]
-            for part in parts:
-                await update.message.reply_text(part)
-                await update.message.chat.send_action("typing")
+            # Telegram имеет ограничение на длину сообщения (4096 символов)
+            # Если ответ длиннее, разбиваем на части
+            if len(response) <= 4096:
+                await update.message.reply_text(response)
+            else:
+                # Разбиваем на части по 4000 символов
+                parts = [response[i:i+4000] for i in range(0, len(response), 4000)]
+                for part in parts:
+                    await update.message.reply_text(part)
+                    await update.message.chat.send_action("typing")
         
         # Если у пользователя закончились сообщения после этого ответа
         if remaining == 0:
@@ -768,7 +1084,11 @@ class HRAssistantBot:
         # Регистрируем обработчики команд
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(CommandHandler("help", self.help_command))
+        self.application.add_handler(CommandHandler("voice", self.voice_command))
         self.application.add_handler(CommandHandler("grant", self.grant_command))
+        
+        # Регистрируем обработчик голосовых сообщений
+        self.application.add_handler(MessageHandler(filters.VOICE, self.handle_voice))
         
         # Регистрируем обработчик текстовых сообщений
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
@@ -777,7 +1097,7 @@ class HRAssistantBot:
         self.application.add_error_handler(self.error_handler)
         
         # Запускаем бота
-        logger.info("Бот запущен и готов к работе!")
+        logger.info("Бот запущен и готов к работе с поддержкой голосовых сообщений!")
         self.application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
